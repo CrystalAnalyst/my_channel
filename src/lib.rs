@@ -1,54 +1,49 @@
 #![allow(unused)]
 #![allow(dead_code)]
 
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
+use std::mem::MaybeUninit;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex};
 
-/// 实现一个简单的channel: 用于多线程之间传递信息(send messages)
-/// 最简单的idea:
-///     1. 用VecDeque作底层数据结构存储信息,
-///        a.当tx写时, 把message入队.
-///        b.当rx读时, 把message出队.
-///     2. 用Mutex<>包裹VecDeque以实现互斥(粗粒度的全局锁).
-///     3. 用CondVar实现阻塞性:
-///        cond1. 当tx写时, 在这里VecDequeue可能会自己扩容,所以不需要担心没位置(full).
-///        cond2. 当rx读时, 如果channel为空也给老子等着(用Convar), 等着tx写然后读了再返回.
-///
+/// 实现一个One-Shot channel
+/// One-shot: 从一个线程向另一个线程准确地发送一条消息
+/// 使用到的工具:
+///     1.UnsafeCell 用于存储message，
+///     2.AtomicBool 用于指示其状态(消息是否可以被消费).
 
-// Very Naive unbounded MPMS
 pub struct Channel<T> {
-    queue: Mutex<VecDeque<T>>,
-    ready: Condvar,
+    message: UnsafeCell<MaybeUninit<T>>,
+    ready: AtomicBool,
 }
+
+unsafe impl<T> Sync for Channel<T> where T: Send {}
 
 impl<T> Channel<T> {
     /// constrcutor
     pub fn new() -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
-            ready: Condvar::new(),
+            message: UnsafeCell::new(MaybeUninit::uninit()),
+            ready: AtomicBool::new(false),
         }
     }
 
-    /// When tx sends a message, push_back the message into the Vecqueue.
-    pub fn send(&self, message: T) {
-        // Get the "temp" Owernship of the queue by `lock()`.
-        self.queue.lock().unwrap().push_back(message);
-        // Wakes up one blocked thread on this condvar.
-        self.ready.notify_one();
+    /// Satefy: user, you should ensures `Once` Semantics
+    pub unsafe fn send(&self, message: T) {
+        (*self.message.get()).write(message);
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// When rx wanna receive a msg, just pop the front
-    /// If there's no data remaining, then use Convar.wait() to block.
-    pub fn receive(&self) -> T {
-        let mut b = self.queue.lock().unwrap();
-        loop {
-            if let Some(msg) = b.pop_front() {
-                return msg;
-            }
-            // attention: Convard::wait() will unlock Mutex() when waiting
-            // and will re-lock the Mutex before returning(when the cond is arrived)
-            b = self.ready.wait(b).unwrap();
+    /// check whether the message is available
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub unsafe fn receive(&self) -> T {
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            panic!("no message available!");
         }
+        (*self.message.get()).assume_init_read()
     }
 }
