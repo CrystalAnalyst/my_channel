@@ -18,15 +18,15 @@ use std::sync::{Arc, Condvar, Mutex};
 /// 通过将调用send 或receive 的能力分别表示为单独的(非 Copy)类型，并在执行操作时使用该对象，我们可以确保每个调用只能发生一次。
 /// 这将我们带到以下接口设计中，其中通道由一对 Sender 和 Receiver 表示。
 
-pub struct Sender<T> {
-    inner: Arc<Channel<T>>,
+pub struct Sender<'a, T> {
+    inner: &'a Channel<T>,
 }
 
-pub struct Receiver<T> {
-    inner: Arc<Channel<T>>,
+pub struct Receiver<'a, T> {
+    inner: &'a Channel<T>,
 }
 
-impl<T> Sender<T> {
+impl<T> Sender<'_, T> {
     pub fn send(self, msg: T) {
         unsafe { (*self.inner.message.get()).write(msg) };
         self.inner
@@ -35,7 +35,7 @@ impl<T> Sender<T> {
     }
 }
 
-impl<T> Receiver<T> {
+impl<T> Receiver<'_, T> {
     pub fn is_ready(&self) -> bool {
         self.inner.ready.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -52,18 +52,28 @@ impl<T> Receiver<T> {
     }
 }
 
-struct Channel<T> {
+pub struct Channel<T> {
     message: UnsafeCell<MaybeUninit<T>>,
     // ready : 表示通道里是否有可用的元素.
     ready: AtomicBool,
 }
 
-pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let a = Arc::new(Channel {
-        message: UnsafeCell::new(MaybeUninit::uninit()),
-        ready: AtomicBool::new(false),
-    });
-    (Sender { inner: a.clone() }, Receiver { inner: a })
+impl<T> Channel<T> {
+    pub const fn new() -> Self {
+        Self {
+            message: UnsafeCell::new(MaybeUninit::uninit()),
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    /// 此外，我们需要一种方法，让用户创建一个 Sender 和 Receiver对象来借用这个通道。
+    /// 这将需要独占借用(&mut Channel)，以确保同一通道不能有多个发送者或接收者。
+    /// 通过同时提供 Sender 和 Receiver ，我们可以将独占借用分成两个共享借用，
+    /// 这样发送方和接收方都可以引用通道，同时防止其他任何东西接触通道。
+    pub fn split<'a>(&'a mut self) -> (Sender<'a, T>, Receiver<'a, T>) {
+        *self = Self::new();
+        (Sender { inner: self }, Receiver { inner: self })
+    }
 }
 
 unsafe impl<T> Sync for Channel<T> where T: Send {}
@@ -86,9 +96,10 @@ mod test {
     // testing
     #[test]
     fn it_works() {
-        let (sender, receiver) = channel();
-        let t = thread::current();
+        let mut channel = Channel::new();
         thread::scope(|s| {
+            let (sender, receiver) = channel.split();
+            let t = thread::current();
             // Sender
             s.spawn(move || {
                 sender.send("hello rustacean!");
@@ -98,9 +109,8 @@ mod test {
             while !receiver.is_ready() {
                 thread::park()
             }
+            // Print Receive message.
+            assert_eq!(receiver.recv(), "hello rustacean!");
         });
-
-        // Print Receive message.
-        assert_eq!(receiver.recv(), "hello rustacean!");
     }
 }
