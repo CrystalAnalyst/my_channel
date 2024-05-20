@@ -3,9 +3,11 @@
 
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, Thread};
 
 /// 实现一个One-Shot channel
 /// One-shot: 从一个线程向另一个线程准确地发送一条消息
@@ -20,10 +22,17 @@ use std::sync::{Arc, Condvar, Mutex};
 
 pub struct Sender<'a, T> {
     inner: &'a Channel<T>,
+    // 为了能够取消接收方的停放，发送方需要知道哪个线程要取消停放。
+    // std::thread::Thread 类型表示线程句柄，这正是我们调用 unpark() 所需要的。
+    // 我们将把接收线程的句柄存储在 Sender 对象中。
+    waiting: Thread,
 }
 
 pub struct Receiver<'a, T> {
     inner: &'a Channel<T>,
+    // 使用特殊的 PhantomData 标记类型将此限制添加到我们的结构中,
+    // 不再允许它在线程之间发送来解决这个问题(在线程之间发送Receiver对象，则句柄waiting将指向错误的线程)
+    _marker: PhantomData<*const ()>,
 }
 
 impl<T> Sender<'_, T> {
@@ -32,6 +41,7 @@ impl<T> Sender<'_, T> {
         self.inner
             .ready
             .store(true, std::sync::atomic::Ordering::Release);
+        self.waiting.unpark();
     }
 }
 
@@ -41,12 +51,12 @@ impl<T> Receiver<'_, T> {
     }
 
     pub fn recv(self) -> T {
-        if !self
+        while !self
             .inner
             .ready
             .swap(false, std::sync::atomic::Ordering::Acquire)
         {
-            panic!("there's no data to read");
+            thread::park();
         }
         unsafe { (*self.inner.message.get()).assume_init_read() }
     }
@@ -72,7 +82,16 @@ impl<T> Channel<T> {
     /// 这样发送方和接收方都可以引用通道，同时防止其他任何东西接触通道。
     pub fn split<'a>(&'a mut self) -> (Sender<'a, T>, Receiver<'a, T>) {
         *self = Self::new();
-        (Sender { inner: self }, Receiver { inner: self })
+        (
+            Sender {
+                inner: self,
+                waiting: thread::current(),
+            },
+            Receiver {
+                inner: self,
+                _marker: PhantomData,
+            },
+        )
     }
 }
 
@@ -99,16 +118,9 @@ mod test {
         let mut channel = Channel::new();
         thread::scope(|s| {
             let (sender, receiver) = channel.split();
-            let t = thread::current();
-            // Sender
             s.spawn(move || {
                 sender.send("hello rustacean!");
-                t.unpark();
             });
-            // Receiver
-            while !receiver.is_ready() {
-                thread::park()
-            }
             // Print Receive message.
             assert_eq!(receiver.recv(), "hello rustacean!");
         });
