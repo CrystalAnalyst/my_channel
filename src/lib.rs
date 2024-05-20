@@ -5,7 +5,7 @@ use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// 实现一个One-Shot channel
 /// One-shot: 从一个线程向另一个线程准确地发送一条消息
@@ -13,12 +13,57 @@ use std::sync::{Condvar, Mutex};
 ///     1.UnsafeCell 用于存储message，
 ///     2.AtomicBool 用于指示其状态(消息是否可以被消费).
 
-pub struct Channel<T> {
+/// 为了防止一个函数被多次调用，我们可以让它按值接受一个参数，对于非 Copy 类型，它会消耗该对象。
+/// 一个对象被消耗或移动后，它就从调用者那里消失了，防止它被再次使用。
+/// 通过将调用send 或receive 的能力分别表示为单独的(非 Copy)类型，并在执行操作时使用该对象，我们可以确保每个调用只能发生一次。
+/// 这将我们带到以下接口设计中，其中通道由一对 Sender 和 Receiver 表示。
+
+pub struct Sender<T> {
+    inner: Arc<Channel<T>>,
+}
+
+pub struct Receiver<T> {
+    inner: Arc<Channel<T>>,
+}
+
+impl<T> Sender<T> {
+    pub fn send(self, msg: T) {
+        unsafe { (*self.inner.message.get()).write(msg) };
+        self.inner
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl<T> Receiver<T> {
+    pub fn is_ready(&self) -> bool {
+        self.inner.ready.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn recv(self) -> T {
+        if !self
+            .inner
+            .ready
+            .swap(false, std::sync::atomic::Ordering::Acquire)
+        {
+            panic!("there's no data to read");
+        }
+        unsafe { (*self.inner.message.get()).assume_init_read() }
+    }
+}
+
+struct Channel<T> {
     message: UnsafeCell<MaybeUninit<T>>,
-    // in_use: 表示通道是否已经被占用(有thread在写)
-    in_use: AtomicBool,
     // ready : 表示通道里是否有可用的元素.
     ready: AtomicBool,
+}
+
+pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    let a = Arc::new(Channel {
+        message: UnsafeCell::new(MaybeUninit::uninit()),
+        ready: AtomicBool::new(false),
+    });
+    (Sender { inner: a.clone() }, Receiver { inner: a })
 }
 
 unsafe impl<T> Sync for Channel<T> where T: Send {}
@@ -31,57 +76,31 @@ impl<T> Drop for Channel<T> {
     }
 }
 
-impl<T> Channel<T> {
-    /// constrcutor
-    pub fn new() -> Self {
-        Self {
-            message: UnsafeCell::new(MaybeUninit::uninit()),
-            in_use: AtomicBool::new(false),
-            ready: AtomicBool::new(false),
-        }
-    }
-
-    /// use `in_use` to ensures that Only sned One message.
-    pub fn send(&self, message: T) {
-        if self.in_use.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            panic!("can't send more than One msg!");
-        }
-        unsafe { (*self.message.get()).write(message) };
-        self.ready.store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    /// check whether the message is available
-    pub fn is_ready(&self) -> bool {
-        self.ready.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub fn receive(&self) -> T {
-        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
-            panic!("no message available!");
-        }
-        unsafe { (*self.message.get()).assume_init_read() }
-    }
-}
-
 #[cfg(test)]
-mod tests {
+mod test {
     use std::thread;
 
+    // import
     use super::*;
 
+    // testing
     #[test]
     fn it_works() {
-        let channel = Channel::new();
+        let (sender, receiver) = channel();
         let t = thread::current();
         thread::scope(|s| {
-            s.spawn(|| {
-                channel.send("hello world!");
+            // Sender
+            s.spawn(move || {
+                sender.send("hello rustacean!");
                 t.unpark();
             });
-            while !channel.is_ready() {
-                thread::park();
+            // Receiver
+            while !receiver.is_ready() {
+                thread::park()
             }
-            assert_eq!(channel.receive(), "hello world!");
-        })
+        });
+
+        // Print Receive message.
+        assert_eq!(receiver.recv(), "hello rustacean!");
     }
 }
